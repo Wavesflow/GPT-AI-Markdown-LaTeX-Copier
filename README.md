@@ -6,13 +6,13 @@ It is designed for users who often copy content from ChatGPT, Claude, DeepSeek, 
 
 ## Installation
 
-1. Install the Tampermonkey browser extension.
+1. Install the Tampermonkey browser extension. 
 
 2. Create a new script in Tampermonkey.
 
 3. Copy the full script from this repository and paste it into the Tampermonkey editor.
 
-4. Save the script.
+4. Save the script. (remember to restart the browser)
 
 That’s it. Open a supported AI website, select the content you want to copy, and press `Ctrl + C`.
 
@@ -42,7 +42,7 @@ If it works correctly, the copied content will be converted into cleaner Markdow
 
 3. 复制本仓库里的完整脚本代码，粘贴到 Tampermonkey 编辑器中。
 
-4. 保存脚本。
+4. 保存脚本。(记得重启一下浏览器)
 
 这样就可以了。打开支持的 AI 网页，选中你想复制的内容，然后按 `Ctrl + C`。
 
