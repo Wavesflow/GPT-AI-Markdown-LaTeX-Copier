@@ -1,0 +1,263 @@
+// ==UserScript==
+// @name         AI Markdown & LaTeX Copier 
+// @namespace    https://tampermonkey.net/
+// @Github       https://github.com/Wavesflow/GPT-AI-Markdown-LaTeX-Copier
+// @version      11.0.0
+// @description  Precision extraction. Safely removes ghost blank lines without breaking native clipboard HTML pasting.
+// @author       Negative Boson + GPT + Gemini
+// @license      MIT
+// @match        *://*.chatgpt.com/*
+// @match        *://chat.openai.com/*
+// @match        *://claude.ai/*
+// @match        *://*.deepseek.com/*
+// @match        *://tongyi.aliyun.com/*
+// @match        *://chat.qwen.ai/*
+// @match        *://*.moonshot.cn/*
+// @grant        GM_addStyle
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // ==========================================
+  // ⚙️ USER SETTINGS (用户设置区)
+  // ==========================================
+  const CONFIG = {
+    // true  = 紧凑模式：去除段落间多余空行（默认）
+    // false = 标准模式：保留双换行（严格遵循 Markdown 标准）
+    compactMode: true
+  };
+  // ==========================================
+
+  // --- 1. UI Styles ---
+  GM_addStyle(`
+    .gpt-md-toast { position: fixed; left: 50%; bottom: 10%; transform: translateX(-50%); z-index: 2147483647; padding: 10px 18px; border-radius: 8px; background: rgba(0, 0, 0, 0.85); color: #fff; font-size: 13px; font-weight: bold; pointer-events: none; box-shadow: 0 8px 24px rgba(0,0,0,0.3); transition: opacity 0.2s ease; opacity: 0; }
+    .latex-tooltip { position: fixed; background: rgba(0, 0, 0, 0.9); color: #00ffcc; padding: 6px 12px; border-radius: 6px; font-size: 12px; font-family: monospace; z-index: 2147483647; pointer-events: none; opacity: 0; transition: opacity 0.2s; max-width: 80vw; word-wrap: break-word; white-space: pre-wrap; box-shadow: 0 4px 12px rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.15); }
+  `);
+
+  const tooltip = document.createElement('div');
+  tooltip.className = 'latex-tooltip';
+  document.body.appendChild(tooltip);
+
+  const showToast = msg => {
+    let e = document.createElement('div');
+    e.className = 'gpt-md-toast'; e.textContent = msg;
+    document.body.appendChild(e);
+    void e.offsetWidth; e.style.opacity = '1';
+    setTimeout(() => { e.style.opacity = '0'; setTimeout(() => e.remove(), 200); }, 1200);
+  };
+
+  // --- 2. Core Math Logic ---
+  const MATH_SELECTOR = 'math, mjx-container, .katex-display, .katex, .MathJax, .math-block, .math-inline, [class*="math-inline"], [class*="math-block"], span.math, span.ztext-math, [data-custom-copy-text], [class*="formula"], .mjx-math';
+
+  const getUniversalTex = (el) => {
+    const attrs = ['data-custom-copy-text', 'data-latex', 'data-tex', 'data-formula', 'data-value', 'data-copy-text', 'data-math'];
+
+    let node = el;
+    let depth = 0;
+    while (node && node !== document.body && depth < 4) {
+      for (let attr of attrs) {
+        if (node.hasAttribute(attr)) return node.getAttribute(attr);
+      }
+      node = node.parentElement;
+      depth++;
+    }
+
+    let childWithData = el.querySelector('[data-custom-copy-text], [data-latex], [data-tex], [data-formula], [data-math]');
+    if (childWithData) {
+      for (let attr of attrs) {
+        if (childWithData.hasAttribute(attr)) return childWithData.getAttribute(attr);
+      }
+    }
+
+    let ann = el.querySelector('annotation[encoding="application/x-tex"], script[type^="math/tex"]');
+    if (ann && ann.textContent) return ann.textContent;
+
+    let aria = el.getAttribute('aria-label');
+    if (aria && (aria.includes('\\') || aria.includes('^') || aria.includes('_'))) {
+        return aria;
+    }
+
+    if (el.tagName.toLowerCase() === 'math' && el.hasAttribute('alttext')) {
+        return el.getAttribute('alttext');
+    }
+
+    return null;
+  };
+
+  const isUniversalBlock = (el, raw) => {
+    if (raw && /^\s*(\\\[|\$\$)/.test(raw)) return true;
+    if (el.closest('.katex-display, .math-block, [class*="math-block"], .math-display, mjx-container[display="true"], .MathJax_Display')) return true;
+    if (el.querySelector('.katex-display, .math-block, [class*="math-block"], .math-display, mjx-container[display="true"], .MathJax_Display')) return true;
+    if (el.getAttribute('display') === 'block' || (el.tagName.toLowerCase() === 'math' && el.getAttribute('display') === 'block')) return true;
+
+    let parent = el.parentElement;
+    if (parent && ['P', 'DIV'].includes(parent.tagName.toUpperCase())) {
+       if (parent.textContent.trim() === el.textContent.trim() && el.textContent.trim() !== '') return true;
+    }
+    return false;
+  };
+
+  const cleanTex = t => {
+    if (!t) return '';
+    let val = document.createElement('textarea'); val.innerHTML = t;
+    return val.value.replace(/^\s*(\\\(|\\\[|\$\$?)(.*?)(\\\)|\\\]|\$\$?)\s*$/s, '$2').trim();
+  };
+
+  const formatMathElement = (el) => {
+    let raw = getUniversalTex(el);
+    if (!raw) raw = el.textContent;
+
+    let tex = cleanTex(raw);
+    if (!tex) return null;
+
+    let block = isUniversalBlock(el, raw);
+    return block ? `$$\n${tex}\n$$` : `$${tex}$`;
+  };
+
+  // --- 3. Markdown Engine ---
+  const parseNode = (node) => {
+    if (node.nodeType === 3) return node.textContent;
+    if (node.nodeType !== 1) return '';
+    let tag = node.tagName.toLowerCase(), e = node;
+
+    if (e.matches('button,svg,style,script') || e.getAttribute('aria-hidden')==='true') return '';
+
+    if (e.matches(MATH_SELECTOR)) {
+      if (e.parentElement?.closest(MATH_SELECTOR)) return '';
+      let mathStr = formatMathElement(e);
+      if (mathStr) {
+          return mathStr.startsWith('$$') ? `\n\n${mathStr}\n\n` : mathStr;
+      }
+    }
+
+    if (tag === 'pre') {
+      let code = e.querySelector('code'), lang = code?.className.match(/language-(\w+)/)?.[1] || '';
+      return `\n\n\`\`\`${lang}\n${(code||e).textContent.replace(/\n$/,'')}\n\`\`\`\n\n`;
+    }
+    if (tag === 'code') return e.closest('pre') ? '' : `\`${e.textContent}\``;
+    if (tag === 'a') return e.href.startsWith('javascript:') ? e.textContent : `[${Array.from(e.childNodes).map(parseNode).join('')}](${e.href})`;
+    if (tag === 'img') return `![${e.alt||''}](${e.src||''})`;
+    if (tag === 'strong' || tag === 'b') return `**${Array.from(e.childNodes).map(parseNode).join('')}**`;
+    if (tag === 'em' || tag === 'i') return `*${Array.from(e.childNodes).map(parseNode).join('')}*`;
+    if (tag === 'p') return `${Array.from(e.childNodes).map(parseNode).join('').replace(/\s+/g, ' ').trim()}\n\n`;
+    if (tag === 'blockquote') return Array.from(e.childNodes).map(parseNode).join('').trim().split('\n').map(l=>`> ${l}`).join('\n')+'\n\n';
+
+    if (tag === 'ul' || tag === 'ol') {
+      let i = 1;
+      return '\n' + Array.from(e.children).filter(c=>c.tagName==='LI').map(li =>
+        `${tag==='ol'?`${i++}.`:'-'} ${Array.from(li.childNodes).map(parseNode).join('').replace(/\s+/g,' ').trim()}`
+      ).join('\n') + '\n\n';
+    }
+
+    if (tag === 'table') {
+      let rows = Array.from(e.querySelectorAll('tr')).map(tr => Array.from(tr.children).map(td => td.textContent.replace(/\|/g, '\\|').trim()));
+      if(!rows.length) return '';
+      let max = Math.max(...rows.map(r=>r.length));
+      rows = rows.map(r => { while(r.length<max) r.push(''); return r; });
+      let sep = Array(max).fill('---');
+      return `\n\n| ${rows[0].join(' | ')} |\n| ${sep.join(' | ')} |\n${rows.slice(1).map(r=>`| ${r.join(' | ')} |`).join('\n')}\n\n`;
+    }
+
+    return Array.from(e.childNodes).map(parseNode).join('');
+  };
+
+  const applyUserFormatting = (md) => {
+    let res = md
+      .replace(/\\\[\s*([\s\S]*?)\s*\\\]/g, '\n\n$$\n$1\n$$\n\n')
+      .replace(/\\\(\s*([\s\S]*?)\s*\\\)/g, '$$$1$')
+      .replace(/(\$\$[\s\S]*?\$\$)/g, '\n\n$1\n\n')
+      .trim();
+
+    // 核心修复：开启多行匹配(m)，找出只有空格/Tab的“幽灵空行”，全给扬了
+    res = res.replace(/^[ \t]+$/gm, '');
+
+    if (CONFIG.compactMode) {
+      // 暴力碾平纯粹的连续换行
+      res = res.replace(/\n{2,}/g, '\n');
+
+      // 语法保护：Markdown 强制要求块级元素外必须有空行，把它们救回来
+      res = res.replace(/([^\n])\n(\$\$)/g, '$1\n\n$2')
+               .replace(/(\$\$)\n([^\n])/g, '$1\n\n$2')
+               .replace(/([^\n])\n(```)/g, '$1\n\n$2')
+               .replace(/(```)\n([^\n])/g, '$1\n\n$2')
+               .replace(/([^\n])\n(\| )/g, '$1\n\n$2');
+    } else {
+      res = res.replace(/\n{3,}/g, '\n\n');
+    }
+
+    return res.trim();
+  };
+
+  // --- 4. Event Hooks ---
+  document.addEventListener('copy', e => {
+    const sel = window.getSelection();
+    if (!sel || !sel.rangeCount || !sel.toString().trim()) return;
+
+    let anchor = sel.anchorNode;
+    anchor = anchor.nodeType === 1 ? anchor : anchor.parentElement;
+
+    if (anchor.closest('textarea, input')) return;
+    if (anchor.closest('#prompt-textarea, #chat-input, [placeholder]')) return;
+
+    try {
+      let div = document.createElement('div');
+      for (let i = 0; i < sel.rangeCount; i++) div.appendChild(sel.getRangeAt(i).cloneContents());
+
+      let md = applyUserFormatting(parseNode(div));
+      if (!md) return;
+
+      e.preventDefault();
+      e.stopPropagation();
+
+      // 回归纯净的 plain text 写入，绝不污染 HTML 格式
+      e.clipboardData.setData('text/plain', md);
+
+      showToast('Copied as Markdown');
+    } catch (err) { console.error(err); showToast('Copy failed'); }
+  }, true);
+
+  // Hover Tooltip
+  let tooltipTimeout;
+  document.addEventListener('mouseover', (e) => {
+    const mathEl = e.target.closest(MATH_SELECTOR);
+    if (!mathEl) return;
+
+    mathEl.style.cursor = "pointer";
+    tooltipTimeout = setTimeout(() => {
+      const tex = formatMathElement(mathEl);
+      if (!tex) return;
+      tooltip.textContent = tex;
+      const rect = mathEl.getBoundingClientRect();
+      let topPos = rect.top - tooltip.offsetHeight - 8;
+      if (topPos < 0) topPos = rect.bottom + 8;
+      tooltip.style.left = `${Math.max(10, rect.left)}px`;
+      tooltip.style.top = `${topPos}px`;
+      tooltip.style.opacity = '1';
+    }, 800);
+  });
+
+  document.addEventListener('mouseout', (e) => {
+    if (e.target.closest(MATH_SELECTOR)) {
+      clearTimeout(tooltipTimeout);
+      tooltip.style.opacity = '0';
+    }
+  });
+
+  // Double Click Copy
+  document.addEventListener('dblclick', (e) => {
+    const mathEl = e.target.closest(MATH_SELECTOR);
+    if (!mathEl) return;
+
+    const tex = formatMathElement(mathEl);
+    if (tex) {
+      navigator.clipboard.writeText(tex).then(() => {
+        showToast('LaTeX Formula Copied!');
+        window.getSelection().removeAllRanges();
+        tooltip.style.opacity = '0';
+      });
+    }
+  });
+
+})();
